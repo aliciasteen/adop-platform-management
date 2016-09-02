@@ -99,41 +99,55 @@ if [ -d ${WORKSPACE}/service/aws ]; then
         if $(aws cloudformation describe-stacks --stack-name ${ENVIRONMENT_STACK_NAME} | grep -q "CREATE_COMPLETE")
         then
             echo "Stack has been created in approximately ${TIME_SPENT} seconds."
-            NODE_IP=$(aws cloudformation describe-stacks --stack-name ${ENVIRONMENT_STACK_NAME} --query 'Stacks[].Outputs[?OutputKey==`EC2InstancePrivateIp`].OutputValue' --output text)
-            NEW_INSTANCE_ID=$(aws cloudformation describe-stacks --stack-name ${ENVIRONMENT_STACK_NAME} --query 'Stacks[].Outputs[?OutputKey==`EC2InstanceID`].OutputValue' --output text)
         else
             echo "ERROR : Stack creation failed after ${TIME_SPENT} seconds. Please check the AWS console for more information."
             exit 1
         fi
         
-        echo "Success! The private IP of your new EC2 instance is $NODE_IP"
-        echo "Please use your provided key, ${AWS_KEYPAIR}, in order to SSH onto the instance."
-
-        # Keep looping whilst the EC2 instance is still initializing
-        COUNT=0
-        TIME_SPENT=0
-        while aws ec2 describe-instance-status --instance-ids ${NEW_INSTANCE_ID} | grep -q "initializing" > /dev/null
-        do
+        
+        export AWS_DEFAULT_OUTPUT="text"
+        
+        INSTANCES_LIST=$(aws cloudformation describe-stack-resources --stack-name ${ENVIRONMENT_STACK_NAME}  --query 'StackResources[?ResourceType==`AWS::EC2::Instance`].PhysicalResourceId')
+        INSTANCE_ARRAY=($INSTANCES_LIST)
+                       
+        for ((i=0; i<${#INSTANCE_ARRAY[@]}; i++));do
+                    
+          INSTANCE_ID=${INSTANCE_ARRAY[$i]}
+        
+          echo "Success! The private IP of your new EC2 instance is $(aws ec2 describe-instances --instance-ids $INSTANCE_ID --query 'Reservations[*].Instances[*].PrivateIpAddress')"
+          echo "Please use your provided key, ${AWS_KEYPAIR}, in order to SSH onto the instance."
+            
+            # Keep looping whilst the EC2 instance is still initializing
+            COUNT=0
+            TIME_SPENT=0
+            while aws ec2 describe-instance-status --instance-ids $INSTANCE_ID | grep -q "initializing" > /dev/null
+            do
+                TIME_SPENT=$(($COUNT * $SLEEP_TIME))
+                echo "Attempt ${COUNT} : EC2 Instance ${INSTANCE_ID} still initializing (Time spent : ${TIME_SPENT} seconds)"
+                sleep "${SLEEP_TIME}"
+                COUNT=$((COUNT+1))
+            done
+            
+            # Check that the instance has initalized and all tests have passed
             TIME_SPENT=$(($COUNT * $SLEEP_TIME))
-            echo "Attempt ${COUNT} : EC2 Instance still initializing (Time spent : ${TIME_SPENT} seconds)"
-            sleep "${SLEEP_TIME}"
-            COUNT=$((COUNT+1))
+            if $(aws ec2 describe-instance-status --instance-ids $INSTANCE_ID --query 'InstanceStatuses[0].InstanceStatus' --output text | grep -q "passed")
+            then
+                echo "Instance ${INSTANCE_ID} has been initialized in approximately ${TIME_SPENT} seconds."
+                echo "Please change your default security group depending on the level of access you wish to enable."
+            else
+                echo "ERROR : Instance ${INSTANCE_ID} initialization failed after ${TIME_SPENT} seconds. Please check the AWS console for more information."
+                exit 1
+            fi
+        
         done
         
-        # Check that the instance has initalized and all tests have passed
-        TIME_SPENT=$(($COUNT * $SLEEP_TIME))
-        if $(aws ec2 describe-instance-status --instance-ids ${NEW_INSTANCE_ID} --query 'InstanceStatuses[0].InstanceStatus' --output text | grep -q "passed")
-        then
-            echo "Instance has been initialized in approximately ${TIME_SPENT} seconds."
-            echo "Please change your default security group depending on the level of access you wish to enable."
-        else
-            echo "ERROR : Instance initialization failed after ${TIME_SPENT} seconds. Please check the AWS console for more information."
-            exit 1
-        fi
-
-
+       
         if [ -f ${WORKSPACE}/service/aws/ec2-extension.conf ]; then
-                        
+            
+            EC2_HOST_IP=$(aws cloudformation describe-stacks --stack-name ${ENVIRONMENT_STACK_NAME} --query 'Stacks[].Outputs[?OutputKey==`EC2InstancePrivateIp`].OutputValue' --output text)
+            
+            if [ $EC2_HOST_IP == ""]; then echo "WARNING: Private IP of instance to be proxied not provided. Loading empty NGINX config."; fi
+
             echo "#######################################"
             echo "Adding EC2 instance to NGINX config using xip.io..."
             
@@ -142,7 +156,7 @@ if [ -d ${WORKSPACE}/service/aws ]; then
             
             ## Add nginx configuration
             sed -i "s/###EC2_SERVICE_NAME###/${SERVICE_NAME}/" ec2-extension.conf
-            sed -i "s/###EC2_HOST_IP###/${NODE_IP}/" ec2-extension.conf
+            sed -i "s/###EC2_HOST_IP###/$EC2_HOST_IP/" ec2-extension.conf
             docker cp ec2-extension.conf proxy:/etc/nginx/sites-enabled/${SERVICE_NAME}.conf
             
             ## Reload nginx
@@ -152,6 +166,8 @@ if [ -d ${WORKSPACE}/service/aws ]; then
         else
             echo "INFO: /service/aws/ec2-extension.conf not found"
         fi
+        
+        
         
     else
         echo "INFO: /service/aws/service.template not found"
